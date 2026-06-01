@@ -12,8 +12,7 @@ opts: RunnerOpts,
 
 pub const Benchmark = struct {
     name: []const u8,
-    func: *const fn (*const anyopaque) anyerror!void,
-    input: *const anyopaque,
+    wrapper: *const fn () anyerror!void,
     opts: BenchmarkOpts,
 };
 
@@ -27,9 +26,7 @@ pub const RunnerOpts = struct {
 
     const BaselineStrategy = union(enum) {
         none,
-        /// path to baseline file
         pinned: []const u8,
-        /// path to log file, compare against last entry
         log: []const u8,
     };
 };
@@ -93,26 +90,20 @@ fn formatLabel(allocator: std.mem.Allocator, comptime name: []const u8, comptime
 }
 
 pub fn add(self: *Quartz, comptime name: []const u8, comptime func: anytype, comptime inputs: anytype, opts: BenchmarkOpts) !void {
-    const Args = std.meta.ArgsTuple(@TypeOf(func));
     const allocator = self.arena.allocator();
 
-    const wrapper = struct {
-        fn run(ptr: *const anyopaque) anyerror!void {
-            const args = @as(*const Args, @ptrCast(@alignCast(ptr)));
-            std.mem.doNotOptimizeAway(@call(.auto, func, args.*));
-        }
-    };
-
     inline for (inputs) |input| {
-        const args_ptr = try allocator.create(Args);
-        args_ptr.* = input;
-
         const label = try formatLabel(allocator, name, input);
+
+        const SpecializedWrapper = struct {
+            fn call() anyerror!void {
+                std.mem.doNotOptimizeAway(@call(.auto, func, input));
+            }
+        };
 
         try self.benchmarks.append(allocator, .{
             .name = label,
-            .func = wrapper.run,
-            .input = @as(*const anyopaque, @ptrCast(args_ptr)),
+            .wrapper = SpecializedWrapper.call,
             .opts = opts,
         });
     }
@@ -130,17 +121,17 @@ fn measureTimingOverhead(io: Io, sample_count: usize) f64 {
 }
 
 pub fn run(self: *Quartz) !void {
-    const timing_overhead = measureTimingOverhead(self.io, 100);
+    // const timing_overhead = measureTimingOverhead(self.io, 100);
 
     for (self.benchmarks.items) |*benchmark| {
         var inner_iters: usize = 1;
         while (inner_iters < 10_000_000) {
             const start = std.Io.Clock.awake.now(self.io);
             for (0..inner_iters) |_| {
-                std.mem.doNotOptimizeAway(try benchmark.func(benchmark.input));
+                std.mem.doNotOptimizeAway(try benchmark.wrapper());
             }
             const elapsed: f64 = @floatFromInt(start.untilNow(self.io, .awake).toNanoseconds());
-            if (elapsed >= 1_000_000) break;
+            if (elapsed >= 100_000) break;
             inner_iters = @max(inner_iters * 2, inner_iters + 1);
         }
 
@@ -150,10 +141,10 @@ pub fn run(self: *Quartz) !void {
         for (0..benchmark.opts.sample_size) |_| {
             const start = std.Io.Clock.awake.now(self.io);
             for (0..inner_iters) |_| {
-                std.mem.doNotOptimizeAway(try benchmark.func(benchmark.input));
+                std.mem.doNotOptimizeAway(try benchmark.wrapper());
             }
             const elapsed: f64 = @floatFromInt(start.untilNow(self.io, .awake).toNanoseconds());
-            const per_iter = (elapsed - timing_overhead) / @as(f64, @floatFromInt(inner_iters));
+            const per_iter = (elapsed) / @as(f64, @floatFromInt(inner_iters));
             try samples.append(self.arena.allocator(), @max(per_iter, 0));
         }
 
@@ -186,9 +177,9 @@ pub fn run(self: *Quartz) !void {
             display_avg = avg_ns / 1_000;
             display_fastest = fastest / 1_000;
             display_slowest = slowest / 1_000;
-            unit = "us";
+            unit = "μs";
         }
 
-        std.debug.print("{s}: {d:.3} {s}, fastest: {d:.3} {s}, slowest: {d:.3} {s}\n", .{ benchmark.name, display_avg, unit, display_fastest, unit, display_slowest, unit });
+        std.debug.print("{s}: {d:.3} {s}, fastest: {d:.3} {s}, slowest: {d:.3} {s}. samples: {}, iterations: {}\n", .{ benchmark.name, display_avg, unit, display_fastest, unit, display_slowest, unit, benchmark.opts.sample_size, inner_iters });
     }
 }
